@@ -1,0 +1,8 @@
+pvlib==0.16.1
+pandas>=2.2,<3
+numpy>=1.26
+matplotlib>=3.8
+jupyterlab>=4
+scipy>=1.11
+nbclient>=0.10
+tzdata>=2024.1
