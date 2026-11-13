@@ -117,8 +117,8 @@ the module does not download data or start simulations.
 
 Read `MPC_METHOD.md` for equations, source attribution, and limitations.
 `pv_battery_model.py` exposes the same definitions without notebook execution.
-Run `python -m unittest discover -v` for city lookup, offline workflow, plot naming,
-output isolation, and controller energy-balance checks. Tests do not need internet.
+Run `python -m unittest discover -v` for offline coupled-DFN integration tests,
+voltage/SOC constraints, degradation, and controller energy-balance checks.
 
 MPC tuning: `MPCConfig(horizon_hours=24, forecast="perfect")`.
 Rule-based sizing is the default. For a fresh MPC sizing sweep:
@@ -130,9 +130,76 @@ Add `--forecast persistence` or change `--horizon-hours` to tune MPC.
 on the same selected hardware, saves each dispatch trace, and adds
 `controller_comparison.{png,pdf}`. This can take a long time over five years.
 A comparison on fixed hardware is not evidence of an MPC-optimal system size.
-Battery ageing remains illustrative. No voltage/reactive-power or switching
-controller from Hu et al. is implemented. The hourly EMS cannot validate
-converter stability or cell safety.
+The sizing sweep uses illustrative empirical ageing. Selected hardware also runs
+the detailed electrochemical studies below. No converter switching or reactive
+power controller from Hu et al. is implemented.
+
+## Coupled DFN degradation and voltage protection
+
+The default workflow now runs PyBaMM's **DFN with OKane2022 parameters** after
+sizing. `dfn_degradation.py` enables solvent-diffusion-limited SEI growth, SEI on
+particle cracks, partially reversible lithium plating, porosity changes,
+negative-electrode swelling/cracking, positive-electrode swelling, and
+stress-driven loss of active material. See the
+[PyBaMM coupled-degradation example](https://docs.pybamm.org/en/v25.12.2/source/examples/notebooks/models/coupled-degradation.html)
+and [O'Kane et al. (2022)](https://doi.org/10.1039/D2CP00417H).
+
+By default, independent fresh-cell winter and summer windows each cover 48 hours
+in the first study year. Each runs particle-radius factors 1.0, 0.8 and 1.2,
+applied to both electrodes. These are mechanism studies on selected hardware;
+they do not replace the multi-year empirical sizing calculation or reproduce
+five years of DFN ageing. The low-level `simulate_electrochemical` function also
+accepts longer consecutive hourly profiles without resetting cell state.
+
+The cell controller runs the energy MPC using live electrode SOC and a capacity
+proxy based on LLI/LAM. Every 600 seconds it updates the estimate, solves the LP
+with the remaining current-hour duration, and predicts a full DFN trajectory for
+the proposed constant current. Predictions must stay within **2.55-4.15 V**,
+50 mV inside the unchanged physical 2.5/4.2 V cutoffs. Continuous voltage and SOC
+events supplement 60-second output checks. A bounded current search reduces
+infeasible actions before committing them. Nonzero actions also need a feasible
+one-hour rest prediction at the measured ambient temperature: voltage can rise
+after charging as plated lithium re-intercalates. An additional 5 mV current-action
+reserve leaves room for relaxation. Rejected trajectories consume no
+simulated time and add no degradation to the accepted state. Excess PV is
+curtailed and unmet demand is recorded, preserving the AC energy balance using
+actual integrated cell voltage/current. Physical cutoff events remain enabled;
+an infeasible rest or unusable cell raises an explicit error.
+
+The default SOC upper limit is **99.5%** (`--soc-max 0.995`); the voltage guard
+often limits charging earlier. MPC holds a small additional SOC reserve for
+side reactions. There are no long constant-voltage charging holds. SOC is the
+negative-electrode bulk stoichiometry relative to beginning-of-life endpoints,
+and the scheduling capacity proxy is **not** a measured capacity/SOH test.
+
+The pack uses 13 series cells and `ceil(selected pack Ah / 5 Ah)` parallel cells,
+with power calculated as `Ns * Np * Vcell * Icell`. Actual rounded pack capacity
+and nameplate energy are reported, including their difference from the sizing
+model's 48 V assumption. Lumped thermal dynamics use measured hourly ambient
+temperature, an assumed cooling coefficient, and persistent cell temperature.
+The cracking mesh uses 30 radial points and 5 points in each electrode/separator;
+mesh and tolerance convergence remain necessary before thesis conclusions.
+
+```sh
+# Full default seasonal/radius study after sizing
+python pv_battery_model.py --city Madrid --country ES --years 1
+# Faster exploratory run with the same coupled mechanisms
+python pv_battery_model.py --city Madrid --country ES --years 1 --cell-model SPMe --cell-hours 24 --particle-radius-factors 1.0
+# Empirical sizing/dispatch only
+python pv_battery_model.py --city Madrid --country ES --years 1 --skip-cell-study
+```
+
+`CellStudyConfig` exposes control/output periods, rest prediction duration, thermal
+assumptions, mesh, solver tolerances, voltage reserves and pack layout. For Python-only coarse runs,
+pass `cell_config=CellStudyConfig(enabled=False)` to `run_study`.
+
+Results are saved under the sizing controller's `pybamm_results/` directory:
+`run_metadata.json`, `cell_summary.csv`, and one folder per season/radius with
+`cell_trace.csv`, `hourly_dispatch.csv` and voltage/SOC/degradation PNG/PDF figures.
+The trace includes SEI, crack-SEI and plating capacity losses, LLI, electrode LAM,
+porosity, temperature, current, requested/applied pack power and limiting flags.
+The summary records runtime, completed duration, voltage extrema and rejected
+predictions. Short-window losses should not be extrapolated into lifetime SOH.
 
 Sources:
 

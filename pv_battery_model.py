@@ -34,7 +34,7 @@ class Case:
     battery_bus_v: float = 48.0
     initial_soc: float = 0.65
     soc_min: float = 0.15
-    soc_max: float = 0.95
+    soc_max: float = 0.995
     max_c_rate: float = 0.5
 
     #effektivitet
@@ -89,8 +89,7 @@ class MPCConfig:
 class CellStudyConfig:
     enabled: bool = True
     model: str = "DFN"  # "SPMe" for faster exploratory runs
-    parameter_set: str = "Chen2020"
-    controller_label: str = "MPC perfect"
+    parameter_set: str = "OKane2022"
     # Fresh-cell, independent windows; no five-year electrochemical pre-ageing.
     windows: tuple = (("winter", "2019-01-15"), ("summer", "2019-07-15"))
     hours: int = 48
@@ -101,7 +100,14 @@ class CellStudyConfig:
     thermal: str = "lumped"  # or "isothermal"
     cooling_w_m2_k: float = 10.0  # assumed, not calibrated pack cooling
     output_period_s: int = 60
-    mesh_points: int = 15
+    control_period_s: int = 600
+    mesh_points: int = 5  # through-electrode mesh
+    particle_mesh_points: int = 30  # cracking requires a finer radial mesh
+    soc_ceiling: float = 0.995
+    voltage_margin_v: float = 0.05  # inside the parameter set's hard cutoffs
+    voltage_headroom_v: float = 0.005  # additional reserve for post-charge relaxation
+    rest_prediction_s: int = 3600
+    current_search_iterations: int = 8
     rtol: float = 1e-6
     atol: float = 1e-6
     output_dir: str = "pybamm_results"
@@ -345,7 +351,9 @@ def energy_matrix(h):
     return a
 
 
-def mpc_action(c, cfg, pv, load, i, energy, capacity, power_limit):
+def mpc_action(c, cfg, pv, load, i, energy, capacity, power_limit, first_step_hours=1.0):
+    if not (0 < first_step_hours <= 1):
+        raise ValueError("first_step_hours must be in (0, 1]")
     h = min(cfg.horizon_hours, len(load)-i)
     if cfg.forecast == "perfect":
         generation, demand = pv[i:i+h], load[i:i+h]
@@ -361,10 +369,12 @@ def mpc_action(c, cfg, pv, load, i, energy, capacity, power_limit):
         raise ValueError("forecast must be perfect or persistence")
     surplus = np.maximum(generation-demand, 0)
     deficit = np.maximum(demand-generation, 0)
+    durations = np.ones(h)
+    durations[0] = first_step_hours
     # Direct PV serves load first. These disjoint bounds prohibit simultaneous
     # charge/discharge exactly without binary variables or artificial energy dumping.
-    bounds = ([(0, min(s*c.charge_efficiency, power_limit)) for s in surplus]
-              + [(0, min(d/c.discharge_efficiency, power_limit)) for d in deficit]
+    bounds = ([(0, min(s*c.charge_efficiency, power_limit)*dt) for s, dt in zip(surplus, durations)]
+              + [(0, min(d/c.discharge_efficiency, power_limit)*dt) for d, dt in zip(deficit, durations)]
               + [(c.soc_min*capacity, c.soc_max*capacity)]*h)
     objective = np.r_[np.full(h, cfg.throughput_weight),
                       np.full(h, cfg.throughput_weight-cfg.unserved_weight*c.discharge_efficiency),
@@ -676,9 +686,13 @@ def plot_controller_comparison(c, table, output_dir, show=False):
 
 
 def run_study(c=CASE, controller="rule_based", mpc_config=MPC,
-              compare_controllers=RUN_CONTROLLER_COMPARISON, show=False):
+              compare_controllers=RUN_CONTROLLER_COMPARISON, show=False,
+              cell_config=CELL_STUDY):
     """Save reproducible inputs, sizing trials and dispatch results for one city."""
     expected_hours(c)
+    if cell_config.enabled:
+        from dfn_degradation import validate_config
+        validate_config(c, cell_config)
     if not np.isfinite(c.annual_household_kwh) or c.annual_household_kwh <= 0:
         raise ValueError("Annual load must be positive and finite")
     c = resolve_case(c)
@@ -693,6 +707,7 @@ def run_study(c=CASE, controller="rule_based", mpc_config=MPC,
     profiles = make_profiles(c)
     profiles.to_csv(inputs_dir / "hourly_profiles.csv", index_label="time")
     metadata = {"city": c.city, "case": asdict(c), "mpc": asdict(mpc_config),
+                "cell_study": asdict(cell_config),
                 "sizing_controller": controller, "compare_controllers": compare_controllers,
                 "created_utc": datetime.now(timezone.utc).isoformat(),
                 "provenance": profiles.attrs.get("provenance", {}),
@@ -729,11 +744,16 @@ def run_study(c=CASE, controller="rule_based", mpc_config=MPC,
     summary_table.to_csv(results_dir / "controller_summary.csv", index=False)
     if compare_controllers:
         plot_controller_comparison(c, summary_table, results_dir, show)
+    cell_results = None
+    if cell_config.enabled:
+        from dfn_degradation import run_cell_study
+        cell_results = run_cell_study(c, profiles, selected, cell_config, mpc_config,
+                                      results_dir / cell_config.output_dir, show=show)
     status = "feasible" if selected.feasible else "infeasible: expand the sizing grid or revise the assumptions"
     print(f"{c.city}: {selected.pv_kwp:g} kWp PV, {selected.initial_capacity_ah:g} Ah battery "
           f"({status}).\nOutputs: {root.resolve()}", flush=True)
     return {"case": c, "output_dir": root, "sizing": table,
-            "selected": selected, "controllers": summary_table}
+            "selected": selected, "controllers": summary_table, "cell_study": cell_results}
 
 
 def main(argv=None):
@@ -759,6 +779,13 @@ def main(argv=None):
     parser.add_argument("--controller", choices=["rule_based", "mpc"], default="rule_based")
     parser.add_argument("--forecast", choices=["perfect", "persistence"], default=MPC.forecast)
     parser.add_argument("--horizon-hours", type=int, default=MPC.horizon_hours)
+    parser.add_argument("--soc-max", type=float, default=CASE.soc_max)
+    parser.add_argument("--skip-cell-study", action="store_true", help="Skip detailed PyBaMM runs")
+    parser.add_argument("--cell-model", choices=["DFN", "SPMe"], default=CELL_STUDY.model)
+    parser.add_argument("--cell-hours", type=int, default=CELL_STUDY.hours,
+                        help="Hours per independent winter/summer cell study")
+    parser.add_argument("--particle-radius-factors", nargs="+", type=float,
+                        default=CELL_STUDY.particle_radius_factors)
     parser.add_argument("--compare-controllers", action="store_true",
                         help="Run rule-based, perfect MPC and persistence MPC on the selected hardware (slow)")
     parser.add_argument("--show", action="store_true", help="Also open figures interactively")
@@ -768,13 +795,16 @@ def main(argv=None):
                 start=args.start, years=args.years, annual_household_kwh=args.annual_load_kwh,
                 pv_options_kwp=tuple(args.pv_options), battery_options_ah=tuple(args.battery_options),
                 output_dir=args.output_dir, cache_dir=args.cache_dir, profile_csv=args.profile_csv,
-                radiation_database=args.radiation_database, refresh_pvgis=args.refresh_pvgis)
+                radiation_database=args.radiation_database, refresh_pvgis=args.refresh_pvgis,
+                soc_max=args.soc_max)
     cfg = replace(MPC, horizon_hours=args.horizon_hours, forecast=args.forecast)
+    cell_cfg = replace(CELL_STUDY, enabled=not args.skip_cell_study, model=args.cell_model,
+                       hours=args.cell_hours, particle_radius_factors=tuple(args.particle_radius_factors))
     try:
         expected_hours(c)
         if c.annual_household_kwh <= 0:
             raise ValueError("Annual load must be positive")
-        run_study(c, args.controller, cfg, args.compare_controllers, args.show)
+        run_study(c, args.controller, cfg, args.compare_controllers, args.show, cell_cfg)
     except (ValueError, RuntimeError) as exc:
         parser.exit(1, f"Error: {exc}\n")
 
